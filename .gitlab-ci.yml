@@ -1,0 +1,91 @@
+workflow:
+  rules:
+    - if: ($CI_COMMIT_BRANCH == "dev" || "Staging_env" || "QA_env") && ($CI_PIPELINE_SOURCE == "merge_request_event" || $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "trigger")
+
+stages:
+  - Tests executing
+  - Report generating
+
+variables:
+  ENV: "QA"
+  REPO_PATH: $REPO_PATH_QA
+  TEST_SUITE_NAME: $TEST_SUITE_NAME
+  SLACK_WEBHOOK: $SLACK_WEBHOOK_QA
+  CONFIG_FILE_NAME: $CONFIG_FILE_NAME
+  CONFIG_PASSWORD: $CONFIG_PASSWORD
+  ALLURE_ENDPOINT: $ALLURE_ENDPOINT
+  ALLURE_TOKEN: $ALLURE_TOKEN
+  ALLURE_PROJECT_ID: $ALLURE_PROJECT_ID
+  CI_COMMIT_AUTHOR: $CI_COMMIT_AUTHOR
+  CI_COMMIT_BRANCH: $CI_COMMIT_BRANCH
+  CI_PIPELINE_URL: $CI_PIPELINE_URL
+  CI_COMMIT_MESSAGE: $CI_COMMIT_MESSAGE
+
+test_job:
+  stage: Tests executing
+  cache: {}
+  tags:
+    - aws-win-shell-qa
+  script:
+    - echo "Decrypting config data"
+    - REN ${REPO_PATH}\config\data ${CONFIG_FILE_NAME}
+    - cd "C:\Program Files\7-Zip"
+    - .\7z x ${REPO_PATH}\config\${CONFIG_FILE_NAME} -o"${REPO_PATH}\config" -p"${CONFIG_PASSWORD}"
+    - cd ${REPO_PATH}
+    - echo "Installing node_modules"
+    - npm install
+    - echo "Linter validation"
+    - npm run eslint:validate
+    - echo "Send notification to Slack"
+    - $author_name = ("$CI_COMMIT_AUTHOR").split("<",2)[0]
+    - curl.exe -X POST --data "{'blocks':[{'type':'section','text':{'type':'mrkdwn','text':'The pipeline started on *$CI_COMMIT_BRANCH*:\n*<$CI_PIPELINE_URL |Current pipeline>*'}},{'type':'section', 'fields':[{'type':'mrkdwn', 'text':'*Author:*\n $author_name '},{'type':'mrkdwn', 'text':'*Commit:*\n $CI_COMMIT_MESSAGE '},{'type':'mrkdwn', 'text':'*Pipeline source:*\n $CI_PIPELINE_SOURCE '}]}]}" ${SLACK_WEBHOOK}
+    - echo "Create launch in Allure TestOps"
+    - cd ${REPO_PATH}\tests\infrastructure\allure
+    - .\allurectl.exe launch create --endpoint ${ALLURE_ENDPOINT} --token ${ALLURE_TOKEN} --project-id ${ALLURE_PROJECT_ID} --launch-name “QA - Smoke Test Run”
+    - echo "Get data about launch from Allure TestOps"
+    - $Allure_Launch_List = .\allurectl.exe launch list --endpoint ${ALLURE_ENDPOINT} --token ${ALLURE_TOKEN} --project-id ${ALLURE_PROJECT_ID}
+    - $Allure_Launch_ID = $Allure_Launch_List[1].Split(" ")[0]
+    - $Allure_Launch_URL = 'https://ultraio.testops.cloud/launch/' + $Allure_Launch_ID
+    - Out-File -FilePath "variable.txt" -Encoding ASCII -InputObject $Allure_Launch_URL
+    - echo "Upload test results to Allure TestOps && Running test"
+    - .\allurectl.exe watch --endpoint ${ALLURE_ENDPOINT} --token ${ALLURE_TOKEN} --project-id ${ALLURE_PROJECT_ID} --launch-id ${Allure_Launch_ID} --results ..\..\..\allure-results -- npm -s run ${TEST_SUITE_NAME}
+  after_script:
+    - cd ${REPO_PATH}
+    - npm run posttest
+    - cd ${REPO_PATH}\allure-report\data
+    - $Passed_tests = (Select-String -Path "suites.csv" -Pattern "passed" -AllMatches).Matches.Count
+    - $Failed_tests = (Select-String -Path "suites.csv" -Pattern "failed" -AllMatches).Matches.Count
+    - $Skipped_tests = (Select-String -Path "suites.csv" -Pattern "skipped" -AllMatches).Matches.Count
+    - $All_tests = $Passed_tests + $Failed_tests + $Skipped_tests
+    - cd ${REPO_PATH}\tests\infrastructure\allure
+    - echo "Send notification to Slack"
+    - $Allure_Launch_URL = (Get-Content -Path "variable.txt" -Raw).trim()
+    - >
+      if ( $CI_JOB_STATUS -eq 'success' ) {curl.exe -X POST --data "{'attachments':[{'color':'9acd32','blocks':[{'type':'section','text':{'type':'mrkdwn','text':'The pipeline finished on *$CI_COMMIT_BRANCH*:\n*<$CI_PIPELINE_URL |Current pipeline>*'}},{'type':'section', 'fields':[{'type':'mrkdwn', 'text':'*Job status*\n $CI_JOB_STATUS '},{'type':'mrkdwn', 'text':'*Allure Test Run:*\n $Allure_Launch_URL'},{'type':'mrkdwn', 'text':'*Total:* $All_tests | *Passed:* $Passed_tests | *Failed:* $Failed_tests | *Skipped:* $Skipped_tests '}]}]}]}" ${SLACK_WEBHOOK}}
+      else {curl.exe -X POST --data "{'attachments':[{'color':'ff6347','blocks':[{'type':'section','text':{'type':'mrkdwn','text':'The pipeline finished on *$CI_COMMIT_BRANCH*:\n*<$CI_PIPELINE_URL |Current pipeline>*'}},{'type':'section', 'fields':[{'type':'mrkdwn', 'text':'*Job status*\n $CI_JOB_STATUS '},{'type':'mrkdwn', 'text':'*Allure Test Run:*\n $Allure_Launch_URL'},{'type':'mrkdwn', 'text':'*Total:* $All_tests | *Passed:* $Passed_tests | *Failed:* $Failed_tests | *Skipped:* $Skipped_tests '}]}]}]}" ${SLACK_WEBHOOK}}
+    - echo "Deleting config data"
+    - REN ${REPO_PATH}\config\${CONFIG_FILE_NAME} data
+    - DEL ${REPO_PATH}\config\config.data.json
+
+  allow_failure: true
+  artifacts:
+    when: always
+    paths:
+      - ./allure-results
+      - ./test-data/qase.data.json
+    expire_in: 1 day
+
+allure_job:
+  stage: Report generating
+  tags:
+    - docker
+  image: frankescobar/allure-docker-service
+  script:
+    - allure generate -c ./allure-results -o ./allure-report
+  artifacts:
+    paths:
+      - ./allure-results
+      - ./allure-report
+    expire_in: 1 day
+  rules:
+    - when: always
